@@ -350,6 +350,7 @@ def get_task_spec(task_id: str) -> str:
         "phase1.2": textwrap.dedent("""\
             Create src/config.py with pydantic-settings Settings class.
             Env vars: DATABASE_URL, QDRANT_URL, REDIS_URL, OLLAMA_URL,
+            OPENROUTER_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY,
             API_AUTH_ENABLED, API_KEYS, LOG_LEVEL, VERSION,
             CLINICAL_LLM_MODEL (default: claude-opus-4),
             CRITICAL_THRESHOLDS (JSON dict with per-parameter panic ranges).
@@ -598,50 +599,32 @@ def call_ollama(model: str, prompt: str, temperature: float = 0.3) -> Optional[s
 
 
 def call_cloud_api(model: str, provider: str, prompt: str) -> Optional[str]:
-    """Meghívja a cloud API-t (Anthropic vagy OpenAI)."""
+    """Meghívja a cloud API-t (OpenRouter, Anthropic vagy OpenAI).
+    
+    OpenRouter az ajánlott — egy API kulcs, minden modell elérhető.
+    Környezeti változók (prioritási sorrendben):
+      1. OPENROUTER_API_KEY — ajánlott, minden modellhez
+      2. ANTHROPIC_API_KEY — csak Anthropic modellekhez
+      3. OPENAI_API_KEY — csak OpenAI modellekhez
+    """
     import httpx
 
-    if provider == "anthropic":
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            print(json.dumps({"status": "error", "error": "ANTHROPIC_API_KEY not set"}), file=sys.stderr)
-            return None
-
-        url = "https://api.anthropic.com/v1/messages"
+    # ── 1. OpenRouter (ajánlott — egy API kulcs minden modellhez) ──
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+    if openrouter_key:
+        url = "https://openrouter.ai/api/v1/chat/completions"
         headers = {
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
-        payload = {
-            "model": model,
-            "max_tokens": 8192,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-
-        try:
-            resp = httpx.post(url, json=payload, headers=headers, timeout=300)
-            resp.raise_for_status()
-            data = resp.json()
-            return data["content"][0]["text"]
-        except Exception as e:
-            print(json.dumps({"status": "error", "error": f"Anthropic API error: {str(e)}"}), file=sys.stderr)
-            return None
-
-    elif provider == "openai":
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            print(json.dumps({"status": "error", "error": "OPENAI_API_KEY not set"}), file=sys.stderr)
-            return None
-
-        url = "https://api.openai.com/v1/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {openrouter_key}",
             "Content-Type": "application/json",
+            "HTTP-Referer": "https://github.com/Ranashawik/med-lab-analyzer",
+            "X-Title": "med-lab-analyzer-task-runner",
         }
         payload = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [
+                {"role": "system", "content": "You are a senior Python developer implementing a medical lab analyzer system. Generate clean, type-hinted, async Python code."},
+                {"role": "user", "content": prompt},
+            ],
             "temperature": 0.3,
             "max_tokens": 8192,
         }
@@ -651,10 +634,72 @@ def call_cloud_api(model: str, provider: str, prompt: str) -> Optional[str]:
             resp.raise_for_status()
             data = resp.json()
             return data["choices"][0]["message"]["content"]
+        except httpx.TimeoutException:
+            print(json.dumps({"status": "error", "error": "OpenRouter request timed out after 300s"}), file=sys.stderr)
+            # Fallback to provider-specific
         except Exception as e:
-            print(json.dumps({"status": "error", "error": f"OpenAI API error: {str(e)}"}), file=sys.stderr)
-            return None
+            print(json.dumps({"status": "warn", "error": f"OpenRouter error, trying provider fallback: {str(e)}"}), file=sys.stderr)
+            # Fallback to provider-specific
 
+    # ── 2. Anthropic direkt ──
+    if provider == "anthropic":
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if api_key:
+            url = "https://api.anthropic.com/v1/messages"
+            headers = {
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            }
+            payload = {
+                "model": model,
+                "max_tokens": 8192,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+
+            try:
+                resp = httpx.post(url, json=payload, headers=headers, timeout=300)
+                resp.raise_for_status()
+                data = resp.json()
+                return data["content"][0]["text"]
+            except Exception as e:
+                print(json.dumps({"status": "error", "error": f"Anthropic API error: {str(e)}"}), file=sys.stderr)
+                return None
+
+    # ── 3. OpenAI direkt ──
+    if provider == "openai":
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if api_key:
+            url = "https://api.openai.com/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": "You are a senior Python developer implementing a medical lab analyzer system. Generate clean, type-hinted, async Python code."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 8192,
+            }
+
+            try:
+                resp = httpx.post(url, json=payload, headers=headers, timeout=300)
+                resp.raise_for_status()
+                data = resp.json()
+                return data["choices"][0]["message"]["content"]
+            except Exception as e:
+                print(json.dumps({"status": "error", "error": f"OpenAI API error: {str(e)}"}), file=sys.stderr)
+                return None
+
+    # ── Nincs egyik API kulcs sem ──
+    print(json.dumps({
+        "status": "error",
+        "error": f"No API key available for {provider} model '{model}'. "
+                 f"Set OPENROUTER_API_KEY (recommended), or {provider.upper()}_API_KEY."
+    }), file=sys.stderr)
     return None
 
 
@@ -777,14 +822,14 @@ def main():
 
     # Ellenőrzés: cloud modellekhez API kulcs
     if provider != "ollama":
-        env_key = {
-            "anthropic": "ANTHROPIC_API_KEY",
-            "openai": "OPENAI_API_KEY",
-        }.get(provider)
-        if env_key and not os.environ.get(env_key):
+        # OpenRouter az ajánlott — egy API kulcs minden modellhez
+        has_openrouter = bool(os.environ.get("OPENROUTER_API_KEY"))
+        has_provider_key = bool(os.environ.get(f"{provider.upper()}_API_KEY"))
+        if not has_openrouter and not has_provider_key:
             result = {
                 "status": "error",
-                "error": f"{env_key} environment variable not set. Required for {provider} ({model}, tier {tier}).",
+                "error": f"No API key available for {provider} model '{model}' (tier {tier}). "
+                         f"Set OPENROUTER_API_KEY (recommended) or {provider.upper()}_API_KEY.",
                 "task": task_id,
                 "model": model,
                 "tier": tier,
